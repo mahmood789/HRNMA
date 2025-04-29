@@ -1,32 +1,41 @@
-## app.R
-
 # ---------------------------
 # 1. Load Packages & Setup
 # ---------------------------
+# Ensure these packages are installed: install.packages(c("shiny", "bs4Dash", "shinycssloaders", "promises", "future", "netmeta", "visNetwork", "DT", "readr", "igraph", "dplyr"))
 library(shiny)
-library(bs4Dash)            # For bs4Dash UI
-library(shinycssloaders)    # For spinners on outputs
-library(promises)           # For asynchronous processing
-library(future)             # For asynchronous tasks
-library(netmeta)            # Frequentist network meta-analysis
-library(visNetwork)         # For interactive network visualization
-library(DT)                 # For interactive tables
-library(readr)              # For fast CSV reading
-library(igraph)             # For static network plot generation
+library(bs4Dash)
+library(shinycssloaders)
+library(promises)
+library(future)
+library(netmeta)
+library(visNetwork)
+library(DT)
+library(readr)
+library(igraph)
+library(dplyr) # Added for data manipulation like rename
 
-plan(multisession)          # Set up asynchronous processing
+plan(multisession) # Set up asynchronous processing
 
 # ---------------------------
-# 2. Data Upload Module (Auto-process)
+# 2. Data Upload Module (Revised & Corrected)
 # ---------------------------
 dataUploadUI <- function(id) {
   ns <- NS(id)
   tagList(
     fileInput(ns("file"), "Upload CSV Data", accept = ".csv"),
     radioButtons(ns("format"), "Data Format:",
-                 choices = c("Arm-level (one row per arm)" = "arm",
-                             "Contrast-level (one row per comparison)" = "contrast")),
-    checkboxInput(ns("logTrans"), "Log-transform outcome (if needed)", FALSE),
+                 choices = c("Arm-level (Binary or Survival/Ratio)" = "arm",
+                             "Contrast-level (Log-Ratio)" = "contrast")),
+    # Moved outcome type selection here
+    selectInput(ns("outcomeType"), "Outcome Type:",
+                choices = c("Binary (Events/N)" = "binary",
+                            "Survival/Ratio (Log-HR/Log-Ratio)" = "ratio_cont"), # Clarified expected input
+                selected = "binary"),
+    # Conditional UI for summary measure (RR/OR) for binary data
+    uiOutput(ns("summaryMeasureUI_upload")),
+    checkboxInput(ns("logTrans"), "Input TE is on Ratio Scale (HR/OR/RR)? (Check to log-transform)", FALSE), # Clarified log transform meaning
+    helpText("If using contrast-level data, TE should be log(HR), log(OR), or log(RR) unless the box above is checked."),
+    helpText("For Survival/Ratio arm-level data, input log(HR) or log(Ratio) as 'mean' and SE(log-HR/log-Ratio) as 'sd'."),
     DTOutput(ns("dataPreview"))
   )
 }
@@ -34,52 +43,174 @@ dataUploadUI <- function(id) {
 dataUploadServer <- function(id) {
   moduleServer(id, function(input, output, session) {
     dataset <- reactiveVal(NULL)
+    summaryMeasure <- reactiveVal("RR") # Default for binary
+    
+    # Dynamic UI for RR/OR selection
+    output$summaryMeasureUI_upload <- renderUI({
+      ns <- session$ns
+      req(input$outcomeType)
+      if (input$outcomeType == "binary") {
+        radioButtons(ns("summaryMeasure"), "Binary Summary Measure:",
+                     choices = c("Risk Ratio (RR)" = "RR",
+                                 "Odds Ratio (OR)" = "OR"),
+                     selected = summaryMeasure()) # Use reactiveVal default
+      } else {
+        NULL # No selection needed for survival/ratio
+      }
+    })
+    
+    # Update reactiveVal when radio button changes
+    observeEvent(input$summaryMeasure, {
+      # Only update if the input exists (i.e., outcomeType is binary)
+      if(!is.null(input$summaryMeasure)){
+        summaryMeasure(input$summaryMeasure)
+      }
+    })
+    
     
     observeEvent(input$file, {
       req(input$file)
-      raw <- read_csv(input$file$datapath, show_col_types = FALSE)
+      raw <- tryCatch({
+        read_csv(input$file$datapath, show_col_types = FALSE) %>%
+          rename_all(tolower) # Convert all columns to lower case for consistency
+      }, error = function(e) {
+        showNotification(paste("Error reading CSV:", e$message), type = "error", duration=10)
+        return(NULL)
+      })
+      
+      if (is.null(raw)) return()
+      
+      processed <- NULL
+      error_msg <- NULL
+      sm_to_store <- NULL # Variable to store the determined summary measure
       
       if (input$format == "arm") {
-        # For hazard ratio analysis using arm-level data, we use "ROM" (ratio of means).
-        req_cols <- c("study", "treatment", "mean", "sd", "n")
-        if (!all(req_cols %in% names(raw))) {
-          showNotification(
-            paste("Arm-level data must contain:", paste(req_cols, collapse = ", ")), 
-            type = "error"
-          )
-          return(NULL)
+        if (input$outcomeType == "binary") {
+          req_cols <- c("study", "treatment", "event", "n")
+          if (!all(req_cols %in% names(raw))) {
+            error_msg <- paste("Binary arm-level data must contain:", paste(req_cols, collapse = ", "))
+          } else {
+            # Ensure columns are numeric
+            raw$event <- as.numeric(raw$event)
+            raw$n <- as.numeric(raw$n)
+            if(any(is.na(raw$event)) || any(is.na(raw$n))) {
+              error_msg <- "Non-numeric values found in 'event' or 'n' columns for binary arm-level data."
+            } else if (any(raw$event > raw$n, na.rm=TRUE)) {
+              error_msg <- "Error: 'event' count cannot be greater than 'n' (sample size)."
+            } else {
+              # Use the selected summary measure (RR or OR)
+              sm_selected <- isolate(summaryMeasure()) # Get current selection
+              sm_to_store <- sm_selected # Store for later use
+              pw <- tryCatch({
+                pairwise(treat = treatment, event = event, n = n,
+                         studlab = study, data = raw, sm = sm_selected, allstudies = TRUE)
+              }, error = function(e) {
+                error_msg <<- paste("Error in pairwise calculation for binary data:", e$message)
+                NULL
+              })
+              if (!is.null(pw)) {
+                contrast <- as.data.frame(pw)
+                # Ensure standard column names for netmeta
+                contrast <- contrast %>% rename(te = TE, sete = seTE)
+                processed <- list(raw = raw, contrast = contrast, format = "arm", sm = sm_to_store)
+              }
+            }
+          }
+        } else { # Survival/Ratio arm-level
+          req_cols <- c("study", "treatment", "mean", "sd", "n")
+          if (!all(req_cols %in% names(raw))) {
+            error_msg <- paste("Survival/Ratio arm-level data must contain:", paste(req_cols, collapse = ", "))
+          } else {
+            # Ensure columns are numeric
+            raw$mean <- as.numeric(raw$mean)
+            raw$sd <- as.numeric(raw$sd)
+            raw$n <- as.numeric(raw$n)
+            if(any(is.na(raw$mean)) || any(is.na(raw$sd)) || any(is.na(raw$n))) {
+              error_msg <- "Non-numeric values found in 'mean', 'sd', or 'n' columns for survival/ratio arm-level data."
+            } else {
+              # Use ROM, assuming user input log-HR as mean and SE(log-HR) as sd
+              sm_to_store <- "HR" # Assume HR if using this pathway
+              pw <- tryCatch({
+                pairwise(treat = treatment, mean = mean, sd = sd, n = n,
+                         studlab = study, data = raw, sm = "ROM", allstudies = TRUE)
+              }, error = function(e) {
+                error_msg <<- paste("Error in pairwise calculation for survival/ratio data:", e$message)
+                NULL
+              })
+              if (!is.null(pw)) {
+                contrast <- as.data.frame(pw)
+                # Ensure standard column names for netmeta
+                contrast <- contrast %>% rename(te = TE, sete = seTE)
+                processed <- list(raw = raw, contrast = contrast, format = "arm", sm = sm_to_store)
+              }
+            }
+          }
         }
-        pw <- pairwise(treat = treatment, mean = mean, sd = sd, n = n,
-                       studlab = study, data = raw, sm = "ROM")
-        contrast <- as.data.frame(pw)
-        processed <- list(raw = raw, contrast = contrast, format = "arm")
-      } else {
-        req_cols <- c("studlab", "treat1", "treat2", "TE", "seTE")
+      } else { # Contrast-level
+        req_cols <- c("studlab", "treat1", "treat2", "te", "sete") # Use lower case
         if (!all(req_cols %in% names(raw))) {
-          showNotification(
-            paste("Contrast-level data must contain:", paste(req_cols, collapse = ", ")), 
-            type = "error"
-          )
-          return(NULL)
+          error_msg <- paste("Contrast-level data must contain:", paste(req_cols, collapse = ", "))
+        } else {
+          # Ensure columns are numeric
+          raw$te <- as.numeric(raw$te)
+          raw$sete <- as.numeric(raw$sete)
+          if(any(is.na(raw$te)) || any(is.na(raw$sete))) {
+            error_msg <- "Non-numeric values found in 'te' or 'sete' columns for contrast-level data."
+          } else {
+            # Determine sm based on outcome type selection
+            sm_to_store <- if(isolate(input$outcomeType) == "binary") {
+              isolate(summaryMeasure())
+            } else {
+              "HR" # Assume HR for ratio_cont
+            }
+            processed <- list(raw = raw, contrast = raw, format = "contrast", sm = sm_to_store)
+          }
         }
-        processed <- list(raw = raw, contrast = raw, format = "contrast")
       }
       
-      # Optionally log-transform TE if needed (if data are not already on the log scale)
-      if (input$logTrans && "TE" %in% names(processed$contrast)) {
-        processed$contrast$TE <- log(processed$contrast$TE)
+      if (!is.null(error_msg)) {
+        showNotification(error_msg, type = "error", duration = 10)
+        dataset(NULL)
+        output$dataPreview <- renderDT(NULL)
+        return()
       }
+      
+      # Log transformation for contrast data if requested and TE is positive
+      if (input$format == "contrast" && input$logTrans && "te" %in% names(processed$contrast)) {
+        if(all(processed$contrast$te > 0, na.rm = TRUE)) {
+          processed$contrast$te <- log(processed$contrast$te)
+          # Warning about SE transformation
+          if(any(processed$contrast$sete / abs(processed$contrast$te) > 0.5, na.rm = TRUE)) {
+            showNotification("Warning: Log-transforming TE. Standard errors (seTE) were assumed to be for the log-transformed scale. If they were for the original ratio scale, results may be inaccurate.", type="warning", duration=15)
+          }
+        } else {
+          showNotification("Cannot log-transform TE because some values are zero or negative.", type="error", duration=10)
+          dataset(NULL) # Prevent further processing
+          output$dataPreview <- renderDT(NULL)
+          return()
+        }
+      }
+      
       
       dataset(processed)
-      output$dataPreview <- renderDT({ datatable(head(processed$contrast, 10)) })
+      output$dataPreview <- renderDT({
+        # Ensure column names are consistent before display
+        disp_data <- processed$contrast
+        # Use standard names for display if they exist
+        if("te" %in% names(disp_data)) disp_data <- rename(disp_data, TE = te)
+        if("sete" %in% names(disp_data)) disp_data <- rename(disp_data, seTE = sete)
+        datatable(head(disp_data, 10), options = list(scrollX = TRUE))
+      })
     })
     
+    # Return the reactive list containing raw data, contrast data, format, and sm
     return(reactive({ dataset() }))
   })
 }
 
+
 # ---------------------------
-# 3. Network Plot Module
+# 3. Network Plot Module (No changes needed from previous version)
 # ---------------------------
 networkUI <- function(id) {
   ns <- NS(id)
@@ -129,17 +260,19 @@ networkUI <- function(id) {
 
 networkServer <- function(id, data) {
   moduleServer(id, function(input, output, session) {
-    observeEvent(data(), {
-      req(data())
-      d <- data()
-      if (!is.null(d$contrast)) {
+    observe({ # Use observe to react whenever data() changes
+      d <- data() # Get the reactive value
+      req(d) # Ensure data is not NULL
+      # Use consistent lowercase column names
+      if (!is.null(d$contrast) && all(c("treat1", "treat2") %in% names(d$contrast))) {
         updateSelectInput(session, "focus", choices = unique(c(d$contrast$treat1, d$contrast$treat2)))
       }
     })
     
     networkData <- reactive({
-      req(data())
-      d <- data()
+      d <- data() # Get the reactive value
+      req(d) # Ensure data is not NULL
+      # Use consistent lowercase column names
       if (!is.null(d$contrast) && all(c("treat1", "treat2") %in% names(d$contrast))) {
         nodes <- data.frame(id = unique(c(d$contrast$treat1, d$contrast$treat2)),
                             label = unique(c(d$contrast$treat1, d$contrast$treat2)))
@@ -148,20 +281,23 @@ networkServer <- function(id, data) {
           edges <- edges[edges$from == input$focus | edges$to == input$focus, ]
         }
         list(nodes = nodes, edges = edges)
+      } else {
+        NULL # Return NULL if data is not ready
       }
     })
     
     output$networkPlot <- renderVisNetwork({
       net <- networkData()
-      validate(need(!is.null(net), "No network data available"))
-      visNetwork(net$nodes, net$edges, height = "500px", width = "100%") %>% 
-        visNodes(shape = "dot", size = 20) %>% 
+      validate(need(!is.null(net), "No network data available or data format incorrect."))
+      visNetwork(net$nodes, net$edges, height = "500px", width = "100%") %>%
+        visNodes(shape = "dot", size = 20) %>%
         visEdges(smooth = FALSE)
     })
     
     output$staticNetworkPlot <- renderPlot({
-      req(data())
-      d <- data()
+      d <- data() # Get the reactive value
+      req(d) # Ensure data is not NULL
+      # Use consistent lowercase column names
       if (!is.null(d$contrast) && all(c("treat1", "treat2") %in% names(d$contrast))) {
         edges <- d$contrast[, c("treat1", "treat2")]
         g <- igraph::graph_from_data_frame(edges, directed = FALSE)
@@ -178,6 +314,8 @@ networkServer <- function(id, data) {
              edge.color = input$edgeColor,
              edge.width = input$edgeWidth,
              main = "Static Network Plot (igraph)")
+      } else {
+        plot.new(); text(0.5, 0.5, "Contrast data with 'treat1' and 'treat2' columns needed.")
       }
     })
     
@@ -185,9 +323,8 @@ networkServer <- function(id, data) {
       filename = function() { "NetworkPlot_Static.png" },
       content = function(file) {
         png(file, width = 800, height = 600, units = "px", res = 96)
-        req(data())
-        d <- data()
-        if (!is.null(d$contrast) && all(c("treat1", "treat2") %in% names(d$contrast))) {
+        d <- data() # Get the reactive value
+        if (!is.null(d) && !is.null(d$contrast) && all(c("treat1", "treat2") %in% names(d$contrast))) {
           edges <- d$contrast[, c("treat1", "treat2")]
           g <- igraph::graph_from_data_frame(edges, directed = FALSE)
           layoutFunc <- switch(input$layoutOption,
@@ -205,6 +342,10 @@ networkServer <- function(id, data) {
                main = "Static Network Plot (igraph)")
           dev.off()
         } else {
+          # Create a blank plot with error message if download is attempted without data
+          plot.new()
+          text(0.5, 0.5, "No network data available for download.")
+          dev.off()
           showNotification("No network data available for download.", type = "error")
         }
       }
@@ -212,14 +353,14 @@ networkServer <- function(id, data) {
   })
 }
 
+
 # ---------------------------
-# 4. Analysis Module (Auto-run)
+# 4. Analysis Module (Corrected - accepts selected_sm)
 # ---------------------------
 analysisUI <- function(id) {
   ns <- NS(id)
   tagList(
-    radioButtons(ns("method"), "Analysis Method:",
-                 choices = c("Frequentist (netmeta)" = "freq")),
+    # Removed method selection as only frequentist is used
     radioButtons(ns("effectModel"), "Effect Model:",
                  choices = c("Fixed-effect" = "fixed", "Random-effects" = "random"),
                  selected = "random"),
@@ -229,13 +370,27 @@ analysisUI <- function(id) {
   )
 }
 
-analysisServer <- function(id, data) {
+analysisServer <- function(id, data, selected_sm) { # Added selected_sm argument
   moduleServer(id, function(input, output, session) {
     resultContainer <- reactiveVal(NULL)
     
-    observeEvent(data(), {
-      req(data())
-      d_all <- data()
+    observe({ # Use observe instead of observeEvent to react to data OR model changes
+      d_all <- data() # Get the reactive list
+      req(d_all, d_all$contrast) # Ensure data and contrast data are available
+      # If sm comes from the data list (arm-level processing), use it.
+      # Otherwise, get it from the reactive selected_sm (for contrast-level).
+      sm_from_data <- d_all$sm
+      sm_from_input <- selected_sm()
+      
+      localSM <- if (!is.null(sm_from_data)) {
+        sm_from_data
+      } else if (!is.null(sm_from_input)) {
+        sm_from_input
+      } else {
+        "HR" # Fallback default if neither is available
+      }
+      
+      req(localSM) # Ensure we have a summary measure
       
       # Isolate reactive inputs before the future call
       localEffectModel <- isolate(input$effectModel)
@@ -244,30 +399,57 @@ analysisServer <- function(id, data) {
       output$status <- renderText("Running frequentist analysis...")
       
       future({
-        netfit <- netmeta(
-          TE, seTE, treat1, treat2, studlab, data = d_all$contrast,
-          common = if (localEffectModel == "fixed") TRUE else FALSE,
-          random = if (localEffectModel == "random") TRUE else FALSE,
-          level = localConfLevel,
-          details.chkmultiarm = TRUE
-        )
-        cat("Number of included studies:", netfit$k, "\n")
-        cat("Number of treatments:", netfit$nt, "\n")
-        cat("Treatments:", paste(netfit$trts, collapse = ", "), "\n")
-        if (!is.null(netfit$studies.excluded) && length(netfit$studies.excluded) > 0) {
-          cat("Excluded studies:", paste(netfit$studies.excluded, collapse = ", "), "\n")
+        # Ensure correct column names (lowercase)
+        contrast_data <- d_all$contrast %>%
+          rename_with(tolower)
+        
+        # Make sure TE and seTE columns exist after renaming
+        required_contrast_cols <- c("studlab", "treat1", "treat2", "te", "sete")
+        if (!all(required_contrast_cols %in% names(contrast_data))) {
+          stop(paste("Required contrast columns missing. Need:", paste(required_contrast_cols, collapse=", ")))
         }
+        
+        netfit <- tryCatch({
+          netmeta(
+            TE = te, seTE = sete, treat1 = treat1, treat2 = treat2, studlab = studlab,
+            data = contrast_data,
+            common = (localEffectModel == "fixed"),
+            random = (localEffectModel == "random"),
+            level = localConfLevel,
+            sm = localSM, # Pass the determined summary measure
+            reference.group = "", # Let netmeta determine reference
+            details.chkmultiarm = TRUE,
+            tol.chkmultiarm = 1e-4 # Added tolerance
+          )
+        }, error = function(e){
+          print(paste("Error in netmeta:", e$message)) # Print error to console
+          # Try to provide more info if possible
+          if(grepl("Treatment names must be identical", e$message)){
+            print("Check consistency of treatment names across treat1 and treat2 columns.")
+          }
+          if(grepl("Need at least three different treatments", e$message)){
+            print("Network meta-analysis requires at least 3 distinct treatments in the data.")
+          }
+          NULL # Return NULL on error
+        })
+        
+        if(is.null(netfit)){
+          return(list(method = "freq", model = NULL, nma_text = "Error during netmeta execution. Check console/debug output.", sm = localSM))
+        }
+        
+        # Capture output safely
         nma_text <- capture.output(print(netfit))
-        list(method = "freq", model = netfit, nma_text = paste(nma_text, collapse = "\n"))
+        list(method = "freq", model = netfit, nma_text = paste(nma_text, collapse = "\n"), sm = localSM) # Store sm in result
       }) %...>% resultContainer
-    })
+    }) # End observe
     
     return(reactive({ resultContainer() }))
-  })
+  }) # End moduleServer
 }
 
+
 # ---------------------------
-# 5. Diagnostics Module
+# 5. Diagnostics Module (No changes needed from previous version)
 # ---------------------------
 diagnosticsUI <- function(id) {
   ns <- NS(id)
@@ -285,19 +467,30 @@ diagnosticsServer <- function(id, analysisResult) {
     observeEvent(input$runDiagnostics, {
       req(analysisResult())
       res <- analysisResult()
-      if (res$method != "freq") {
-        output$diagText <- renderText("Diagnostics are only available for frequentist analysis.")
+      if (is.null(res$model) || res$method != "freq") {
+        output$diagText <- renderText("Diagnostics require a successful frequentist analysis.")
       } else {
-        diag_res <- decomp.design(res$model)
-        output$diagText <- renderPrint({ diag_res })
+        diag_res <- tryCatch(decomp.design(res$model), error = function(e) e)
+        if(inherits(diag_res, "error")){
+          output$diagText <- renderPrint({ paste("Error running decomp.design:", diag_res$message) })
+        } else {
+          output$diagText <- renderPrint({ diag_res })
+        }
       }
     })
     output$funnelPlot <- renderPlot({
       req(analysisResult())
       res <- analysisResult()
-      if (res$method == "freq") {
-        ref <- if (!is.null(res$model$trts) && length(res$model$trts) > 0) res$model$trts[1] else ""
-        funnel(res$model, order = ref)
+      if (!is.null(res$model) && res$method == "freq") {
+        # Check if treatments exist and there are at least 2 before plotting
+        if(!is.null(res$model$trts) && length(res$model$trts) >= 2){
+          ref <- res$model$trts[1] # Use first treatment as reference
+          tryCatch(funnel(res$model, order = ref), error = function(e){
+            plot.new(); text(0.5, 0.5, paste("Funnel plot error:", e$message))
+          })
+        } else {
+          plot.new(); text(0.5, 0.5, "Funnel plot requires at least 2 treatments.")
+        }
       } else {
         plot.new()
         text(0.5, 0.5, "Funnel plot not available.", cex = 1.3)
@@ -308,9 +501,15 @@ diagnosticsServer <- function(id, analysisResult) {
       content = function(file) {
         png(file, width = 800, height = 600, units = "px", res = 96)
         res <- analysisResult()
-        if (res$method == "freq") {
-          ref <- if (!is.null(res$model$trts) && length(res$model$trts) > 0) res$model$trts[1] else ""
-          funnel(res$model, order = ref)
+        if (!is.null(res$model) && res$method == "freq") {
+          if(!is.null(res$model$trts) && length(res$model$trts) >= 2){
+            ref <- res$model$trts[1]
+            tryCatch(funnel(res$model, order = ref), error = function(e){
+              plot.new(); text(0.5, 0.5, paste("Funnel plot error:", e$message))
+            })
+          } else {
+            plot.new(); text(0.5, 0.5, "Funnel plot requires at least 2 treatments.")
+          }
         } else {
           plot.new()
           text(0.5, 0.5, "Funnel plot not available.", cex = 1.3)
@@ -321,22 +520,23 @@ diagnosticsServer <- function(id, analysisResult) {
   })
 }
 
+
 # ---------------------------
-# 6. Results Module (with More Options, More Plots and More Text Results)
+# 6. Results Module (Revised for dynamic labels and checks)
 # ---------------------------
 resultsUI <- function(id) {
   ns <- NS(id)
   tabsetPanel(
-    tabPanel("Forest Plot", 
+    tabPanel("Forest Plot",
              fluidRow(
                column(3, textInput(ns("forestTitle"), "Plot Title:", value = "Forest Plot")),
-               column(3, textInput(ns("forestXlab"), "X-axis Label:", value = "Hazard Ratio")),
+               column(3, uiOutput(ns("forestXlabUI"))), # Dynamic X-label
                column(3, sliderInput(ns("forestXlim"), "X-axis Range:",
                                      min = 0.1, max = 10, value = c(0.5, 3), step = 0.1)),
                column(3, numericInput(ns("forestCex"), "Label Size (cex):", value = 1, min = 0.5, max = 3, step = 0.1))
              ),
              fluidRow(
-               column(3, numericInput(ns("forestDigits"), "Digits (HR):", value = 2, min = 0, max = 5, step = 1)),
+               column(3, numericInput(ns("forestDigits"), "Digits (Ratio):", value = 2, min = 0, max = 5, step = 1)),
                column(3, numericInput(ns("forestDigitsSE"), "Digits (SE):", value = 2, min = 0, max = 5, step = 1)),
                column(3, numericInput(ns("forestDigitsPval"), "Digits (p-val):", value = 3, min = 0, max = 5, step = 1))
              ),
@@ -356,46 +556,8 @@ resultsUI <- function(id) {
              br(),
              downloadButton(ns("dlRelativeEffects"), "Download Relative Effects Summary")
     ),
-    tabPanel("NMA Results", 
+    tabPanel("NMA Results",
              verbatimTextOutput(ns("nmaResults"))
-    ),
-    tabPanel("Extra Analysis",
-             fluidRow(
-               column(6, plotOutput(ns("scatterPlot")) %>% withSpinner()),
-               column(6, verbatimTextOutput(ns("extraText")))
-             )
-    ),
-    tabPanel("Additional Plots",
-             fluidRow(
-               column(12, verbatimTextOutput(ns("studySummary")))
-             )
-    ),
-    tabPanel("Excluded Studies",
-             verbatimTextOutput(ns("excludedText"))
-    ),
-    tabPanel("Network Graph",
-             fluidRow(
-               column(6, textInput(ns("netGraphTitle"), "Graph Title:", value = "Network Graph")),
-               column(6, textInput(ns("longLabels"), "Full Treatment Labels (comma separated):", value = "DrugA,DrugB,DrugC,DrugD"))
-             ),
-             plotOutput(ns("netGraphPlot")) %>% withSpinner(),
-             br(),
-             downloadButton(ns("dlNetGraphPNG"), "Download Network Graph as PNG")
-    ),
-    tabPanel("Direct vs Indirect Evidence",
-             plotOutput(ns("directIndPlot")) %>% withSpinner(),
-             br(),
-             downloadButton(ns("dlDirectIndPNG"), "Download Direct/Indirect Evidence Plot as PNG")
-    ),
-    tabPanel("Effect Estimate Table",
-             DTOutput(ns("effectTable")),
-             br(),
-             downloadButton(ns("dlEffectTable"), "Download Effect Table as CSV")
-    ),
-    tabPanel("Treatment Ranking",
-             DTOutput(ns("treatmentRanking")),
-             br(),
-             downloadButton(ns("dlTreatmentRanking"), "Download Treatment Ranking as CSV")
     ),
     tabPanel("Net Heat Plot",
              plotOutput(ns("netHeatPlot")) %>% withSpinner(),
@@ -422,47 +584,76 @@ resultsUI <- function(id) {
              br(),
              downloadButton(ns("dlDetailedModelSummary"), "Download Model Summary as TXT")
     ),
-    tabPanel("Study-Level Analysis",
+    tabPanel("Network Graph",
              fluidRow(
-               plotOutput(ns("studyLevelPlot"), width = "800px", height = "600px") %>% withSpinner()
+               column(6, textInput(ns("netGraphTitle"), "Graph Title:", value = "Network Graph")),
+               column(6, textInput(ns("longLabels"), "Full Treatment Labels (comma separated):", value = "DrugA,DrugB,DrugC,DrugD"))
              ),
-             fluidRow(
-               verbatimTextOutput(ns("studyLevelSummary"))
-             ),
+             plotOutput(ns("netGraphPlot")) %>% withSpinner(),
              br(),
-             downloadButton(ns("dlStudyLevel"), "Download Study-Level Analysis as TXT")
+             downloadButton(ns("dlNetGraphPNG"), "Download Network Graph as PNG")
     ),
-    tabPanel("Additional Text Results",
-             verbatimTextOutput(ns("textResults")),
+    tabPanel("Effect Estimate Table",
+             DTOutput(ns("effectTable")),
              br(),
-             downloadButton(ns("dlTextResults"), "Download Text Results as TXT")
+             downloadButton(ns("dlEffectTable"), "Download Effect Table as CSV")
+    ),
+    tabPanel("Treatment Ranking",
+             DTOutput(ns("treatmentRanking")),
+             br(),
+             downloadButton(ns("dlTreatmentRanking"), "Download Treatment Ranking as CSV")
     )
   )
 }
 
 resultsServer <- function(id, analysisResult) {
   moduleServer(id, function(input, output, session) {
-    # Forest Plot (for HR, we exponentiate the log HR to display HR)
-    output$forestPlot <- renderPlot({
-      req(analysisResult())
+    
+    # Dynamic UI for Forest Plot X-axis Label
+    output$forestXlabUI <- renderUI({
+      ns <- session$ns
       res <- analysisResult()
+      default_lab <- "Effect Measure (Log Scale)" # Fallback
+      if(!is.null(res) && !is.null(res$sm)){ # Check analysis result and sm
+        if(res$sm == "RR") default_lab <- "Risk Ratio (RR)"
+        if(res$sm == "OR") default_lab <- "Odds Ratio (OR)"
+        if(res$sm %in% c("HR", "ROM")) default_lab <- "Hazard Ratio / Ratio of Means"
+      }
+      textInput(ns("forestXlab"), "X-axis Label:", value = default_lab)
+    })
+    
+    # Forest Plot
+    output$forestPlot <- renderPlot({
+      res <- analysisResult()
+      validate(need(!is.null(res) && !is.null(res$model), "NMA model not available. Please run analysis first."))
       if (res$method == "freq") {
-        netmeta:::forest.netmeta(
-          res$model,
-          main = input$forestTitle,
-          xlab = input$forestXlab,
-          xlim = input$forestXlim,
-          cex = input$forestCex,
-          digits = input$forestDigits,
-          digits.se = input$forestDigitsSE,
-          digits.pval = input$forestDigitsPval,
-          col.square = input$forestSquareColor,
-          col.diamond = input$forestDiamondColor,
-          transf = exp
-        )
+        # Use tryCatch for plotting robustness
+        tryCatch({
+          # Ensure xlim is valid
+          xlim_val <- input$forestXlim
+          if(is.null(xlim_val) || length(xlim_val) != 2 || xlim_val[1] >= xlim_val[2]){
+            xlim_val <- NULL # Use default if invalid
+          }
+          
+          netmeta:::forest.netmeta(
+            res$model,
+            main = input$forestTitle,
+            xlab = input$forestXlab,
+            xlim = xlim_val,
+            cex = input$forestCex,
+            digits = input$forestDigits,
+            digits.se = input$forestDigitsSE,
+            digits.pval = input$forestDigitsPval,
+            col.square = input$forestSquareColor,
+            col.diamond = input$forestDiamondColor,
+            transf = exp # Exponentiate log-ratios
+          )
+        }, error = function(e){
+          plot.new(); text(0.5, 0.5, paste("Forest plot error:", e$message))
+        })
       } else {
         plot.new()
-        text(0.5, 0.5, "Forest plot not available.", cex = 1.3)
+        text(0.5, 0.5, "Forest plot not available for this method.", cex = 1.3)
       }
     })
     
@@ -471,20 +662,28 @@ resultsServer <- function(id, analysisResult) {
       content = function(file) {
         png(file, width = 800, height = 600, units = "px", res = 96)
         res <- analysisResult()
-        if (res$method == "freq") {
-          netmeta:::forest.netmeta(
-            res$model,
-            main = input$forestTitle,
-            xlab = input$forestXlab,
-            xlim = input$forestXlim,
-            cex = input$forestCex,
-            digits = input$forestDigits,
-            digits.se = input$forestDigitsSE,
-            digits.pval = input$forestDigitsPval,
-            col.square = input$forestSquareColor,
-            col.diamond = input$forestDiamondColor,
-            transf = exp
-          )
+        if (!is.null(res$model) && res$method == "freq") {
+          tryCatch({
+            xlim_val <- input$forestXlim
+            if(is.null(xlim_val) || length(xlim_val) != 2 || xlim_val[1] >= xlim_val[2]){
+              xlim_val <- NULL
+            }
+            netmeta:::forest.netmeta(
+              res$model,
+              main = input$forestTitle,
+              xlab = input$forestXlab,
+              xlim = xlim_val,
+              cex = input$forestCex,
+              digits = input$forestDigits,
+              digits.se = input$forestDigitsSE,
+              digits.pval = input$forestDigitsPval,
+              col.square = input$forestSquareColor,
+              col.diamond = input$forestDiamondColor,
+              transf = exp
+            )
+          }, error = function(e){
+            plot.new(); text(0.5, 0.5, paste("Forest plot error:", e$message))
+          })
         } else {
           plot.new()
           text(0.5, 0.5, "Forest plot not available.", cex = 1.3)
@@ -493,16 +692,17 @@ resultsServer <- function(id, analysisResult) {
       }
     )
     
-    # Relative Effects
+    # Relative Effects Table
     output$relativeEffectsText <- renderPrint({
-      req(analysisResult())
       res <- analysisResult()
+      validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
       if (res$method == "freq" && !is.null(res$model$trts) &&
           length(unique(res$model$trts)) >= 2) {
-        league <- netleague(res$model)
+        league <- tryCatch(netleague(res$model), error=function(e) NULL)
+        if(is.null(league)) return("Could not generate league table.")
         print(league)
       } else {
-        cat("Relative effects summary not available (insufficient treatments).")
+        cat("Relative effects summary not available (insufficient treatments or non-frequentist model).")
       }
     })
     
@@ -510,366 +710,275 @@ resultsServer <- function(id, analysisResult) {
       filename = function() { "RelativeEffectsSummary.txt" },
       content = function(file) {
         res <- analysisResult()
-        if (res$method == "freq" && !is.null(res$model$trts) &&
+        if (!is.null(res$model) && res$method == "freq" && !is.null(res$model$trts) &&
             length(unique(res$model$trts)) >= 2) {
-          league <- netleague(res$model)
-          txt <- capture.output(print(league))
-          writeLines(txt, con = file)
+          league <- tryCatch(netleague(res$model), error=function(e) NULL)
+          if(is.null(league)){
+            writeLines("Could not generate league table.", con = file)
+          } else {
+            txt <- capture.output(print(league))
+            writeLines(txt, con = file)
+          }
         } else {
-          writeLines("Relative effects summary not available (insufficient treatments).", con = file)
+          writeLines("Relative effects summary not available.", con = file)
         }
       }
     )
     
-    # NMA Results
+    # NMA Results Summary
     output$nmaResults <- renderPrint({
-      req(analysisResult())
       res <- analysisResult()
+      validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
       cat("=== NMA Analysis Summary ===\n")
-      cat(res$nma_text, "\n")
-      if (!is.null(res$model$Q)) cat("Q statistic: ", res$model$Q, "\n")
-      if (!is.null(res$model$I2)) cat("I-squared: ", res$model$I2, "\n")
-      if (!is.null(res$model$tau)) cat("Tau: ", res$model$tau, "\n")
-      if (!is.null(res$model$tau^2)) cat("Tau^2: ", res$model$tau^2, "\n")
-      if (!is.null(res$model$pval.Q)) cat("p-value (heterogeneity): ", res$model$pval.Q, "\n")
+      # Print captured summary text if available, otherwise print model object
+      if(!is.null(res$nma_text) && nzchar(res$nma_text)){
+        cat(res$nma_text, "\n")
+      } else {
+        print(res$model) # Fallback
+      }
+      # Add key stats explicitly if available in model object
+      if (!is.null(res$model$k)) cat("Number of studies:", res$model$k, "\n")
+      if (!is.null(res$model$n)) cat("Number of observations:", res$model$n, "\n") # If available
+      if (!is.null(res$model$Q)) cat("Q statistic: ", round(res$model$Q,2), "\n")
+      if (!is.null(res$model$I2)) cat("I-squared: ", scales::percent(res$model$I2, accuracy=0.1), "\n")
+      if (!is.null(res$model$tau)) cat("Tau: ", round(res$model$tau,3), "\n")
+      if (!is.null(res$model$tau2)) cat("Tau^2: ", round(res$model$tau2,3), "\n") # Use tau2 if available
+      if (!is.null(res$model$pval.Q)) cat("p-value (heterogeneity): ", format.pval(res$model$pval.Q, digits=3), "\n")
       if (!is.null(res$model$studies.excluded) && length(res$model$studies.excluded) > 0) {
         cat("Excluded studies in this analysis:", paste(res$model$studies.excluded, collapse = ", "), "\n")
       }
     })
     
-    # Extra Analysis: Scatter Plot and Extra Text
-    output$scatterPlot <- renderPlot({
-      req(analysisResult())
-      model <- analysisResult()$model
-      if (!is.null(model$data)) {
-        dat <- model$data
-        if (all(c("TE", "seTE") %in% names(dat))) {
-          plot(dat$TE, dat$seTE, 
-               xlab = "Log Hazard Ratio", 
-               ylab = "Standard Error", 
-               main = "Scatter Plot of Effect Sizes")
-          if ("studlab" %in% names(dat)) {
-            text(dat$TE, dat$seTE, labels = dat$studlab, pos = 3, cex = 0.8)
-          }
-        } else {
-          plot.new()
-          text(0.5, 0.5, "TE and seTE not found in model$data.")
-        }
-      } else {
-        plot.new()
-        text(0.5, 0.5, "Original data not available.")
-      }
-    })
-    
-    output$extraText <- renderPrint({
-      req(analysisResult())
-      model <- analysisResult()$model
-      cat("=== Extra Analysis Summary ===\n")
-      if (!is.null(model$Q)) cat("Q statistic: ", model$Q, "\n")
-      if (!is.null(model$I2)) cat("I-squared: ", model$I2, "\n")
-      if (!is.null(model$tau)) cat("Tau: ", model$tau, "\n")
-      if (!is.null(model$tau^2)) cat("Tau^2: ", model$tau^2, "\n")
-      if (!is.null(model$pval.Q)) cat("p-value (heterogeneity): ", model$pval.Q, "\n")
-      if (!is.null(model$data)) {
-        cat("\nData summary:\n")
-        print(summary(model$data))
-      }
-    })
-    
-    # Additional Plots: Study Data Summary
-    output$studySummary <- renderPrint({
-      req(analysisResult())
-      model <- analysisResult()$model
-      if (!is.null(model$data)) {
-        cat("Study Data Summary:\n")
-        print(summary(model$data))
-      } else {
-        cat("No study data available for summary.")
-      }
-    })
-    
-    # Excluded Studies
-    output$excludedText <- renderPrint({
-      req(analysisResult())
-      res <- analysisResult()
-      if (res$method == "freq") {
-        if (!is.null(res$model$studies.excluded) && length(res$model$studies.excluded) > 0) {
-          cat("Excluded Studies:\n")
-          print(res$model$studies.excluded)
-        } else {
-          cat("No excluded studies.")
-        }
-      } else {
-        cat("Excluded studies not available for non-frequentist analysis.")
-      }
-    })
-    
-    # --- New Tab: Network Graph ---
-    output$netGraphPlot <- renderPlot({
-      req(analysisResult())
-      res <- analysisResult()
-      long.labels <- trimws(unlist(strsplit(input$longLabels, split = ",")))
-      if (length(long.labels) != length(res$model$trts))
-        long.labels <- res$model$trts
-      netgraph(res$model, labels = long.labels, main = input$netGraphTitle)
-    })
-    output$dlNetGraphPNG <- downloadHandler(
-      filename = function() { "NetworkGraph.png" },
-      content = function(file) {
-        png(file, width = 800, height = 600, units = "px", res = 96)
-        req(analysisResult())
-        res <- analysisResult()
-        long.labels <- trimws(unlist(strsplit(input$longLabels, split = ",")))
-        if (length(long.labels) != length(res$model$trts))
-          long.labels <- res$model$trts
-        netgraph(res$model, labels = long.labels, main = input$netGraphTitle)
-        dev.off()
-      }
-    )
-    
-    # --- New Tab: Direct vs Indirect Evidence ---
-    output$directIndPlot <- renderPlot({
-      req(analysisResult())
-      res <- analysisResult()
-      d.evidence <- direct.evidence.plot(res$model)
-      plot(d.evidence)
-      title("Direct vs Indirect Evidence")
-    })
-    output$dlDirectIndPNG <- downloadHandler(
-      filename = function() { "DirectIndirectEvidence.png" },
-      content = function(file) {
-        png(file, width = 800, height = 600, units = "px", res = 96)
-        req(analysisResult())
-        res <- analysisResult()
-        d.evidence <- direct.evidence.plot(res$model)
-        plot(d.evidence)
-        title("Direct vs Indirect Evidence")
-        dev.off()
-      }
-    )
-    
-    # --- New Tab: Effect Estimate Table ---
-    output$effectTable <- renderDT({
-      req(analysisResult())
-      res <- analysisResult()
-      league <- netleague(res$model)
-      datatable(league$fixed, options = list(pageLength = 10))
-    })
-    output$dlEffectTable <- downloadHandler(
-      filename = function() { "EffectEstimateTable.csv" },
-      content = function(file) {
-        req(analysisResult())
-        res <- analysisResult()
-        league <- netleague(res$model)
-        write.csv(league$fixed, file, row.names = TRUE)
-      }
-    )
-    
-    # --- New Tab: Treatment Ranking ---
-    output$treatmentRanking <- renderDT({
-      req(analysisResult())
-      res <- analysisResult()
-      ranking <- netrank(res$model, small.values = "good")
-      ranking_df <- data.frame(Treatment = names(ranking$ranking.common),
-                               PScore = as.numeric(ranking$ranking.common))
-      datatable(ranking_df, options = list(pageLength = 10))
-    })
-    output$dlTreatmentRanking <- downloadHandler(
-      filename = function() { "TreatmentRanking.csv" },
-      content = function(file) {
-        req(analysisResult())
-        res <- analysisResult()
-        ranking <- netrank(res$model, small.values = "good")
-        ranking_df <- data.frame(Treatment = names(ranking$ranking.common),
-                                 PScore = as.numeric(ranking$ranking.common))
-        write.csv(ranking_df, file, row.names = FALSE)
-      }
-    )
-    
-    # --- New Tab: Net Heat Plot ---
+    # --- Net Heat Plot ---
     output$netHeatPlot <- renderPlot({
-      req(analysisResult())
       res <- analysisResult()
-      netheat(res$model, random = TRUE)
+      validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
+      tryCatch(netheat(res$model, random = (res$model$random)), error = function(e){
+        plot.new(); text(0.5, 0.5, paste("Net Heat plot error:", e$message))
+      })
     })
     output$dlNetHeatPNG <- downloadHandler(
       filename = function() { "NetHeatPlot.png" },
       content = function(file) {
         png(file, width = 800, height = 600, units = "px", res = 96)
-        req(analysisResult())
         res <- analysisResult()
-        netheat(res$model, random = TRUE)
+        if(!is.null(res$model)){
+          tryCatch(netheat(res$model, random = (res$model$random)), error = function(e){
+            plot.new(); text(0.5, 0.5, paste("Net Heat plot error:", e$message))
+          })
+        } else { plot.new(); text(0.5, 0.5, "Model not available.") }
         dev.off()
       }
     )
     
-    # --- New Tab: Net Splitting ---
+    # --- Net Splitting ---
     output$netSplitPlot <- renderPlot({
-      req(analysisResult())
       res <- analysisResult()
-      nsplit <- netsplit(res$model)
-      plot(nsplit, main = "Net Splitting Analysis")
+      validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
+      nsplit <- tryCatch(netsplit(res$model), error = function(e) NULL)
+      validate(need(!is.null(nsplit), "Net splitting analysis failed or not applicable (e.g., insufficient paths)."))
+      tryCatch(plot(nsplit, main = "Net Splitting Analysis"), error = function(e){
+        plot.new(); text(0.5, 0.5, paste("Net Split plot error:", e$message))
+      })
     })
     output$dlNetSplitPNG <- downloadHandler(
       filename = function() { "NetSplitPlot.png" },
       content = function(file) {
         png(file, width = 800, height = 600, units = "px", res = 96)
-        req(analysisResult())
         res <- analysisResult()
-        nsplit <- netsplit(res$model)
-        plot(nsplit, main = "Net Splitting Analysis")
+        if(!is.null(res$model)){
+          nsplit <- tryCatch(netsplit(res$model), error = function(e) NULL)
+          if(!is.null(nsplit)){
+            tryCatch(plot(nsplit, main = "Net Splitting Analysis"), error = function(e){
+              plot.new(); text(0.5, 0.5, paste("Net Split plot error:", e$message))
+            })
+          } else { plot.new(); text(0.5, 0.5, "Net splitting failed or not applicable.") }
+        } else { plot.new(); text(0.5, 0.5, "Model not available.") }
         dev.off()
       }
     )
     
-    # --- New Tab: Comparison-Adjusted Funnel Plot ---
+    # --- Comparison-Adjusted Funnel Plot ---
     output$funnelPlotAdj <- renderPlot({
-      req(analysisResult())
       res <- analysisResult()
-      funnel(res$model, order = res$model$trts, pch = 19, method.bias = "Egger")
+      validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
+      if (!is.null(res$model$trts) && length(res$model$trts) >= 2) {
+        tryCatch(funnel(res$model, order = res$model$trts, pch = 19, method.bias = "Egger"), error = function(e){
+          plot.new(); text(0.5, 0.5, paste("Funnel plot error:", e$message))
+        })
+      } else {
+        plot.new()
+        text(0.5, 0.5, "Comparison-adjusted funnel plot requires at least 2 treatments.", cex = 1.3)
+      }
     })
     output$dlFunnelAdjPNG <- downloadHandler(
       filename = function() { "ComparisonAdjustedFunnelPlot.png" },
       content = function(file) {
         png(file, width = 800, height = 600, units = "px", res = 96)
-        req(analysisResult())
         res <- analysisResult()
-        funnel(res$model, order = res$model$trts, pch = 19, method.bias = "Egger")
+        if (!is.null(res$model) && !is.null(res$model$trts) && length(res$model$trts) >= 2) {
+          tryCatch(funnel(res$model, order = res$model$trts, pch = 19, method.bias = "Egger"), error = function(e){
+            plot.new(); text(0.5, 0.5, paste("Funnel plot error:", e$message))
+          })
+        } else {
+          plot.new()
+          text(0.5, 0.5, "Funnel plot requires at least 2 treatments.", cex = 1.3)
+        }
         dev.off()
       }
     )
     
-    # --- New Tab: Leave-One-Out Analysis ---
+    # --- Leave-One-Out Analysis ---
     output$leaveOneOut <- renderDT({
-      req(analysisResult())
       res <- analysisResult()
-      if(exists("leave1out", envir = asNamespace("netmeta"))) {
-        loo <- netmeta:::leave1out(res$model)
-      } else {
-        loo <- data.frame(Message = "leave1out function not available.")
-      }
-      datatable(loo, options = list(pageLength = 10))
+      validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
+      loo_res <- tryCatch({
+        # Use the internal function if available, otherwise return message
+        if(exists("leave1out", envir = asNamespace("netmeta"))) {
+          netmeta:::leave1out(res$model)
+        } else {
+          data.frame(Message = "leave1out function not currently available in loaded netmeta version.")
+        }
+      }, error = function(e) {
+        data.frame(Error = paste("Leave-one-out analysis failed:", e$message))
+      })
+      datatable(loo_res, options = list(pageLength = 10, scrollX = TRUE))
     })
+    
     output$dlLeaveOneOut <- downloadHandler(
       filename = function() { "LeaveOneOutAnalysis.csv" },
       content = function(file) {
-        req(analysisResult())
         res <- analysisResult()
-        if(exists("leave1out", envir = asNamespace("netmeta"))) {
-          loo <- netmeta:::leave1out(res$model)
-          write.csv(loo, file, row.names = FALSE)
-        } else {
-          write.csv(data.frame(Message = "leave1out function not available."), file, row.names = FALSE)
-        }
+        validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
+        loo_res <- tryCatch({
+          if(exists("leave1out", envir = asNamespace("netmeta"))) {
+            netmeta:::leave1out(res$model)
+          } else {
+            data.frame(Message = "leave1out function not currently available in loaded netmeta version.")
+          }
+        }, error = function(e) {
+          data.frame(Error = paste("Leave-one-out analysis failed:", e$message))
+        })
+        write.csv(loo_res, file, row.names = FALSE)
       }
     )
     
-    # --- New Tab: Detailed Model Summary ---
+    # --- Detailed Model Summary ---
     output$detailedModelSummary <- renderPrint({
-      req(analysisResult())
       res <- analysisResult()
+      validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
       summary(res$model)
     })
     output$dlDetailedModelSummary <- downloadHandler(
       filename = function() { "DetailedModelSummary.txt" },
       content = function(file) {
-        req(analysisResult())
         res <- analysisResult()
+        validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
         txt <- capture.output(summary(res$model))
         writeLines(txt, con = file)
       }
     )
     
-    # --- New Tab: Study-Level Analysis ---
-    output$studyLevelPlot <- renderPlot({
-      req(analysisResult())
-      model <- analysisResult()$model
-      if (!is.null(model$data)) {
-        if (all(c("TE", "seTE") %in% names(model$data))) {
-          boxplot(TE ~ studlab, data = model$data, main = "Boxplot of Log HR by Study",
-                  xlab = "Study", ylab = "Log Hazard Ratio")
-        } else {
-          studies <- unique(model$data$studlab)
-          eff <- sapply(studies, function(s) {
-            subset_data <- subset(model$data, studlab == s)
-            mean(subset_data$TE, na.rm = TRUE)
-          })
-          eff <- eff[!is.na(eff)]
-          if(length(eff)==0) {
-            plot.new(); text(0.5,0.5,"No study-level effect available")
-          } else {
-            barplot(eff, main = "Average Log HR by Study", xlab = "Study", ylab = "Average Log HR", las = 2)
-          }
-        }
-      } else {
-        plot.new()
-        text(0.5, 0.5, "Study-level plot not available.")
+    # --- Network Graph ---
+    output$netGraphPlot <- renderPlot({
+      res <- analysisResult()
+      validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
+      long.labels <- trimws(unlist(strsplit(input$longLabels, split = ",")))
+      # Use model treatments if labels don't match or are empty
+      if (length(long.labels) == 0 || length(long.labels) != length(res$model$trts)) {
+        long.labels <- res$model$trts
+        updateTextInput(session, "longLabels", value = paste(long.labels, collapse=",")) # Update UI
       }
+      tryCatch(netgraph(res$model, labels = long.labels, main = input$netGraphTitle), error = function(e){
+        plot.new(); text(0.5, 0.5, paste("Network graph error:", e$message))
+      })
     })
-    output$studyLevelSummary <- renderPrint({
-      req(analysisResult())
-      model <- analysisResult()$model
-      if (!is.null(model$data)) {
-        cat("Study-level Summary:\n")
-        print(summary(model$data))
-      } else {
-        cat("No study-level data available.")
-      }
-    })
-    output$dlStudyLevel <- downloadHandler(
-      filename = function() { "StudyLevelAnalysis.txt" },
+    output$dlNetGraphPNG <- downloadHandler(
+      filename = function() { "NetworkGraph.png" },
       content = function(file) {
-        model <- analysisResult()$model
-        txt <- capture.output({
-          if (!is.null(model$data)) {
-            cat("Study-level Summary:\n")
-            print(summary(model$data))
-          } else {
-            cat("Study-level analysis not available.")
-          }
-        })
-        writeLines(txt, con = file)
+        png(file, width = 800, height = 600, units = "px", res = 96)
+        res <- analysisResult()
+        if(!is.null(res$model)){
+          long.labels <- trimws(unlist(strsplit(input$longLabels, split = ",")))
+          if (length(long.labels) == 0 || length(long.labels) != length(res$model$trts)) long.labels <- res$model$trts
+          tryCatch(netgraph(res$model, labels = long.labels, main = input$netGraphTitle), error = function(e){
+            plot.new(); text(0.5, 0.5, paste("Network graph error:", e$message))
+          })
+        } else { plot.new(); text(0.5, 0.5, "Model not available.") }
+        dev.off()
       }
     )
     
-    # --- New Tab: Additional Text Results ---
-    output$textResults <- renderPrint({
-      req(analysisResult())
+    # --- Effect Estimate Table (League Table) ---
+    output$effectTable <- renderDT({
       res <- analysisResult()
-      cat("=== Additional Text Summary ===\n\n")
-      cat("Treatments:\n")
-      print(res$model$trts)
-      cat("\nNumber of included studies:", res$model$k, "\n")
-      cat("Number of treatments:", res$model$nt, "\n")
-      cat("\nFixed-Effect Estimate Matrix (HR):\n")
-      print(round(exp(res$model$TE.fixed), 2))
-      cat("\nHeterogeneity (I-squared):", res$model$I2, "\n")
-      cat("Q statistic:", res$model$Q, "\n")
+      validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
+      league <- tryCatch(netleague(res$model), error=function(e) NULL)
+      validate(need(!is.null(league), "Could not generate league table."))
+      # Decide whether to show fixed or random based on model run
+      table_to_show <- if(!is.null(league$random)) league$random else league$fixed
+      # Ensure table is a data frame for datatable
+      if(!is.data.frame(table_to_show)) table_to_show <- as.data.frame(table_to_show)
+      datatable(table_to_show, options = list(pageLength = 10, scrollX = TRUE))
     })
-    output$dlTextResults <- downloadHandler(
-      filename = function() { "AdditionalTextResults.txt" },
+    output$dlEffectTable <- downloadHandler(
+      filename = function() { "EffectEstimateTable.csv" },
       content = function(file) {
-        req(analysisResult())
         res <- analysisResult()
-        txt <- capture.output({
-          cat("=== Additional Text Summary ===\n\n")
-          cat("Treatments:\n")
-          print(res$model$trts)
-          cat("\nNumber of included studies:", res$model$k, "\n")
-          cat("Number of treatments:", res$model$nt, "\n")
-          cat("\nFixed-Effect Estimate Matrix (HR):\n")
-          print(round(exp(res$model$TE.fixed), 2))
-          cat("\nHeterogeneity (I-squared):", res$model$I2, "\n")
-          cat("Q statistic:", res$model$Q, "\n")
-        })
-        writeLines(txt, con = file)
+        validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
+        league <- tryCatch(netleague(res$model), error=function(e) NULL)
+        validate(need(!is.null(league), "Could not generate league table."))
+        table_to_show <- if(!is.null(league$random)) league$random else league$fixed
+        write.csv(table_to_show, file, row.names = TRUE) # Keep row names for league table
       }
     )
-  })
+    
+    # --- Treatment Ranking ---
+    output$treatmentRanking <- renderDT({
+      res <- analysisResult()
+      validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
+      ranking <- tryCatch(netrank(res$model, small.values = "good"), error=function(e) NULL)
+      validate(need(!is.null(ranking), "Could not calculate treatment rankings."))
+      # Use common or random depending on model
+      rank_scores <- if(!is.null(ranking$ranking.random)) ranking$ranking.random else ranking$ranking.common
+      p_scores <- if(!is.null(ranking$Pscore.random)) ranking$Pscore.random else ranking$Pscore.common
+      
+      # Check if scores are NULL or empty before creating data frame
+      validate(need(!is.null(rank_scores) && !is.null(p_scores) && length(rank_scores) > 0, "Ranking scores are unavailable."))
+      
+      ranking_df <- data.frame(
+        Treatment = names(rank_scores),
+        PScore = as.numeric(p_scores)
+      ) %>% arrange(desc(PScore)) # Arrange by P-score
+      
+      datatable(ranking_df, options = list(pageLength = 10, order = list(list(1, 'desc')))) # Order by PScore column (index 1)
+    })
+    output$dlTreatmentRanking <- downloadHandler(
+      filename = function() { "TreatmentRanking.csv" },
+      content = function(file) {
+        res <- analysisResult()
+        validate(need(!is.null(res) && !is.null(res$model), "NMA model not available."))
+        ranking <- tryCatch(netrank(res$model, small.values = "good"), error=function(e) NULL)
+        validate(need(!is.null(ranking), "Could not calculate treatment rankings."))
+        rank_scores <- if(!is.null(ranking$ranking.random)) ranking$ranking.random else ranking$ranking.common
+        p_scores <- if(!is.null(ranking$Pscore.random)) ranking$Pscore.random else ranking$Pscore.common
+        validate(need(!is.null(rank_scores) && !is.null(p_scores) && length(rank_scores) > 0, "Ranking scores are unavailable."))
+        ranking_df <- data.frame(
+          Treatment = names(rank_scores),
+          PScore = as.numeric(p_scores)
+        ) %>% arrange(desc(PScore))
+        write.csv(ranking_df, file, row.names = FALSE)
+      }
+    )
+    # --- Add other results outputs as needed ---
+    
+  }) # End moduleServer
 }
 
+
+
 # ---------------------------
-# 7. Inconsistency Module (Text & Download)
+# 7. Inconsistency Module (No changes needed from previous version)
 # ---------------------------
 inconsistencyUI <- function(id) {
   ns <- NS(id)
@@ -884,48 +993,56 @@ inconsistencyUI <- function(id) {
 inconsistencyServer <- function(id, analysisResult) {
   moduleServer(id, function(input, output, session) {
     decomp_res <- reactive({
-      req(analysisResult())
       res <- analysisResult()
+      req(res, res$model) # Ensure result and model are available
       if (res$method == "freq") {
-        decomp.design(res$model)
+        tryCatch(decomp.design(res$model), error=function(e) e)
       } else {
         NULL
       }
     })
     
     output$decompText <- renderPrint({
-      req(decomp_res())
-      print(decomp_res())
+      res_decomp <- decomp_res()
+      if(is.null(res_decomp)) {
+        cat("Inconsistency analysis not applicable or model not ready.")
+      } else if(inherits(res_decomp, "error")) {
+        cat("Error running inconsistency analysis:", res_decomp$message)
+      } else {
+        print(res_decomp)
+      }
     })
     
     output$dlDecompText <- downloadHandler(
       filename = function() { "InconsistencySummary.txt" },
       content = function(file) {
-        res <- analysisResult()
-        if (res$method == "freq") {
-          decomp_out <- decomp.design(res$model)
-          txt <- capture.output(print(decomp_out))
-          writeLines(txt, con = file)
+        res_decomp <- decomp_res()
+        if(is.null(res_decomp)) {
+          writeLines("Inconsistency analysis not applicable or model not ready.", con = file)
+        } else if(inherits(res_decomp, "error")) {
+          writeLines(paste("Error running inconsistency analysis:", res_decomp$message), con = file)
         } else {
-          writeLines("Design-based inconsistency not available.", con = file)
+          txt <- capture.output(print(res_decomp))
+          writeLines(txt, con = file)
         }
       }
     )
   })
 }
 
+
 # ---------------------------
-# 8. Example CSV Files Module
+# 8. Example CSV Files Module (Revised for Binary/Ratio)
 # ---------------------------
 exampleCSVUI <- function(id) {
   ns <- NS(id)
   tagList(
     h3("Example CSV Files"),
-    h4("Arm-level Data Example"),
-    verbatimTextOutput(ns("armCSV")),
-    downloadButton(ns("dlArmCSV"), "Download Arm-level CSV"),
+    h4("Arm-level Binary Data Example (Events/N)"),
+    verbatimTextOutput(ns("armCSVBin")),
+    downloadButton(ns("dlArmCSVBin"), "Download Binary Arm-level CSV"),
     br(), br(),
-    h4("Contrast-level Data Example"),
+    h4("Contrast-level Log-Ratio Data Example (Log-RR/Log-OR/Log-HR)"),
     verbatimTextOutput(ns("contrastCSV")),
     downloadButton(ns("dlContrastCSV"), "Download Contrast-level CSV")
   )
@@ -933,45 +1050,34 @@ exampleCSVUI <- function(id) {
 
 exampleCSVServer <- function(id) {
   moduleServer(id, function(input, output, session) {
-    armCSV <- "study,treatment,mean,sd,n
-Study1,DrugA,2.5,0.5,30
-Study1,DrugB,1.8,0.6,30
-Study2,DrugA,3.0,0.7,25
-Study2,DrugB,2.7,0.6,25
-Study2,DrugC,2.9,0.8,25
-Study3,DrugA,4.1,1.1,40
-Study3,DrugB,3.2,0.9,40
-Study3,DrugC,3.4,1.0,40
-Study3,DrugD,3.1,1.2,40
-Study4,DrugB,2.0,0.4,20
-Study4,DrugC,2.5,0.3,20
-Study4,DrugD,1.9,0.5,20
-Study5,DrugA,3.1,0.6,35
-Study5,DrugD,2.2,0.7,35"
+    # Sample for Arm-level Binary (event/n)
+    armCSVBin <- "study,treatment,event,n
+Study1,DrugA,10,50
+Study1,Placebo,15,50
+Study2,DrugB,8,60
+Study2,Placebo,12,60
+Study3,DrugC,5,55
+Study3,Placebo,10,55
+Study4,DrugA,7,40
+Study4,DrugB,10,40
+Study5,DrugC,6,45
+Study5,DrugD,9,45"
     
+    # Sample for Contrast-level (Log-Ratio TE/seTE)
     contrastCSV <- "studlab,treat1,treat2,TE,seTE
-Study1,DrugA,DrugB,0.7,0.2
-Study2,DrugA,DrugB,0.3,0.25
-Study2,DrugA,DrugC,0.1,0.3
-Study2,DrugB,DrugC,-0.2,0.15
-Study3,DrugA,DrugB,1.0,0.3
-Study3,DrugA,DrugC,0.8,0.35
-Study3,DrugA,DrugD,0.9,0.4
-Study3,DrugB,DrugC,0.2,0.2
-Study3,DrugB,DrugD,0.1,0.25
-Study3,DrugC,DrugD,-0.1,0.3
-Study4,DrugB,DrugC,0.5,0.2
-Study4,DrugB,DrugD,0.3,0.25
-Study4,DrugC,DrugD,0.2,0.15
-Study5,DrugA,DrugD,0.4,0.2"
+Study1,DrugA,Placebo,-0.51,0.37
+Study2,DrugB,Placebo,-0.41,0.41
+Study3,DrugC,Placebo,-0.74,0.51
+Study4,DrugA,DrugB,-0.36,0.52
+Study5,DrugC,DrugD,-0.45,0.60" # Example log-ratios
     
-    output$armCSV <- renderText({ armCSV })
+    output$armCSVBin <- renderText({ armCSVBin })
     output$contrastCSV <- renderText({ contrastCSV })
     
-    output$dlArmCSV <- downloadHandler(
-      filename = function() { "example_arm_data.csv" },
+    output$dlArmCSVBin <- downloadHandler(
+      filename = function() { "example_binary_arm_data.csv" },
       content = function(file) {
-        writeLines(armCSV, con = file)
+        writeLines(armCSVBin, con = file)
       }
     )
     
@@ -984,17 +1090,19 @@ Study5,DrugA,DrugD,0.4,0.2"
   })
 }
 
+
 # ---------------------------
 # 9. Main App UI & Server (bs4Dash)
 # ---------------------------
 ui <- bs4DashPage(
-  title = "786-MIII NMA Shiny App (Frequentist Only - Hazard Ratio)",
+  title = "786-MIII NMA Shiny App (Frequentist - Ratio Outcomes)", # Updated title
   header = bs4DashNavbar(title = "786-MIII NMA Shiny App"),
   sidebar = bs4DashSidebar(
     bs4SidebarMenu(
+      id = "sidebarMenu", # Added id for observing tab changes
       bs4SidebarMenuItem("Data Upload", tabName = "dataUpload", icon = icon("upload")),
       bs4SidebarMenuItem("Network Plot", tabName = "network", icon = icon("project-diagram")),
-      bs4SidebarMenuItem("Analysis", tabName = "analysis", icon = icon("chart-line")),
+      bs4SidebarMenuItem("Analysis Setup", tabName = "analysis", icon = icon("sliders-h")), # Renamed
       bs4SidebarMenuItem("Diagnostics", tabName = "diagnostics", icon = icon("stethoscope")),
       bs4SidebarMenuItem("Results", tabName = "results", icon = icon("table")),
       bs4SidebarMenuItem("Inconsistency", tabName = "inconsistency", icon = icon("exclamation-triangle")),
@@ -1015,13 +1123,24 @@ ui <- bs4DashPage(
 )
 
 server <- function(input, output, session) {
-  dataset <- dataUploadServer("dataUpload")
-  analysisRes <- analysisServer("analysis", data = dataset)
-  networkServer("network", data = dataset)
+  # Instantiate modules and pass reactive summary measure from data upload to analysis
+  data_output <- dataUploadServer("dataUpload")
+  
+  # Create a reactive expression specifically for the selected summary measure
+  selected_sm_reactive <- reactive({
+    # Need to access the specific input from the module UI
+    # Use %||% to provide a default if the input doesn't exist yet (e.g., before UI renders)
+    input$`dataUpload-summaryMeasure` %||% "HR" # Default to HR if binary UI not shown or not selected
+  })
+  
+  analysisRes <- analysisServer("analysis", data = data_output, selected_sm = selected_sm_reactive) # Pass the reactive expression
+  
+  networkServer("network", data = data_output)
   resultsServer("results", analysisResult = analysisRes)
   diagnosticsServer("diagnostics", analysisResult = analysisRes)
   inconsistencyServer("inconsistency", analysisResult = analysisRes)
   exampleCSVServer("exampleCSV")
 }
+
 
 shinyApp(ui = ui, server = server)
